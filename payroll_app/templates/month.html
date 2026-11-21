@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ month }} 明细{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>{{ month }} 入账明细
+    <span class="badge {{ info.status }}">{{ '开放' if info.status == 'open' else '已封账' }}</span>
+  </h2>
+  <p class="hint">
+    {% if info.status == 'closed' %}
+      该月已封账，明细已锁定。后续勘误会在新的开放月生成“冲回 + 重入账”流水。
+    {% else %}
+      该月开放，可继续导入原单或提交勘误。
+    {% endif %}
+    · <a href="{{ url_for('export', month=month) }}">下载该月 CSV</a>
+  </p>
+  <table>
+    <thead>
+      <tr><th>#</th><th>薪资单号</th><th>薪资所属月</th><th>流水类型</th>
+          <th>成本中心</th><th>金额（分）</th><th>勘误号</th><th>修订号</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="num">{{ r.id }}</td>
+        <td class="mono">{{ r.slip_no }}</td>
+        <td>{{ r.slip_month }}</td>
+        <td>{{ labels.get(r.kind, r.kind) }}</td>
+        <td class="mono">{{ r.cost_center }}</td>
+        <td class="num {{ 'neg' if r.amount_cents < 0 else '' }}">{{ r.amount_cents }}</td>
+        <td class="mono">{{ r.adjust_no or '—' }}</td>
+        <td class="num">{{ r.revision }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty">该月没有流水</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

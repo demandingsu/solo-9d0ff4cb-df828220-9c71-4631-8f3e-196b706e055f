@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="grid">
+  <div class="card">
+    <h2>月份管理</h2>
+    <form method="post" action="{{ url_for('month_open') }}" class="inline">
+      <label>开放月份 <input name="month" placeholder="2026-12" pattern="\d{4}-\d{2}" required></label>
+      <button type="submit">开放</button>
+    </form>
+    <p class="hint">封账不可逆；要入账新勘误，请先开放下一个入账月。</p>
+    <table>
+      <thead>
+        <tr><th>月份</th><th>状态</th><th>封账时间</th><th>流水条数</th><th>净额（分）</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for m in months %}
+        <tr>
+          <td><a href="{{ url_for('month_detail', month=m.month) }}">{{ m.month }}</a></td>
+          <td><span class="badge {{ m.status }}">{{ '开放' if m.status == 'open' else '已封账' }}</span></td>
+          <td class="mono">{{ m.closed_at or '—' }}</td>
+          <td class="num">{{ m.postings }}</td>
+          <td class="num">{{ m.total_cents }}</td>
+          <td class="actions">
+            <a class="btn small" href="{{ url_for('export', month=m.month) }}">下载 CSV</a>
+            {% if m.status == 'open' %}
+            <form method="post" action="{{ url_for('month_close') }}" class="inline"
+                  onsubmit="return confirm('封账后该月明细不可再改，确定封账 {{ m.month }}？');">
+              <input type="hidden" name="month" value="{{ m.month }}">
+              <button type="submit" class="danger small">封账</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <h2>导入原始薪资单</h2>
+    <form method="post" action="{{ url_for('import_originals') }}" enctype="multipart/form-data">
+      <label>入账月
+        <select name="entry_month" required>
+          <option value="">— 选择开放月份 —</option>
+          {% for m in open_months %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>CSV 文件（表头：薪资单号,成本中心,金额分）
+        <input type="file" name="file" accept=".csv,text/csv" required>
+      </label>
+      <button type="submit">导入</button>
+    </form>
+    <p class="hint">薪资所属月等于入账月。整份文件校验通过才会写入；任一失败则整批不写入。</p>
+  </div>
+
+  <div class="card">
+    <h2>提交勘误</h2>
+    <form method="post" action="{{ url_for('import_adjustments') }}" enctype="multipart/form-data">
+      <label>入账月
+        <select name="entry_month" required>
+          <option value="">— 选择开放月份 —</option>
+          {% for m in open_months %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>CSV 文件（表头：勘误号,薪资单号,成本中心,金额分）
+        <input type="file" name="file" accept=".csv,text/csv" required>
+      </label>
+      <button type="submit">提交勘误</button>
+    </form>
+    <p class="hint">勘误号幂等：同号同内容只处理一次；同号不同内容整批拒绝。</p>
+  </div>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <h2>当前生效薪资单</h2>
+    <table>
+      <thead><tr><th>薪资单号</th><th>所属月</th><th>成本中心</th><th>金额（分）</th><th>生效入账月</th></tr></thead>
+      <tbody>
+        {% for s in slips %}
+        <tr>
+          <td class="mono">{{ s.slip_no }}</td>
+          <td>{{ s.slip_month }}</td>
+          <td class="mono">{{ s.cost_center }}</td>
+          <td class="num">{{ s.amount_cents }}</td>
+          <td>{{ s.entry_month }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">暂无数据</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>已处理勘误</h2>
+    <table>
+      <thead><tr><th>勘误号</th><th>薪资单号</th><th>方式</th><th>入账月</th><th>成本中心</th><th>金额（分）</th></tr></thead>
+      <tbody>
+        {% for a in adjustments %}
+        <tr>
+          <td class="mono">{{ a.adjust_no }}</td>
+          <td class="mono">{{ a.slip_no }}</td>
+          <td>{{ '直接改原行' if a.mode == 'inplace' else '冲回+重入账' }}</td>
+          <td>{{ a.entry_month }}</td>
+          <td class="mono">{{ a.cost_center }}</td>
+          <td class="num">{{ a.amount_cents }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">暂无勘误</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}
