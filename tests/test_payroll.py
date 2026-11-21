@@ -491,28 +491,31 @@ def test_batch_duplicate_and_new_in_same_file(client):
 
 
 def test_unexpected_write_error_mid_batch_keeps_original_state(client, monkeypatch):
-    """模拟写库中途异常：第一行已写入也要整体回滚。"""
+    """模拟写库中途异常：入账事务内已有写入也要整体回滚。"""
     add_month(client, "2026-12")
     post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\nS2,CC-B,2000\n")
     open_close(client, "2026-12")
     add_month(client, "2027-01")
 
-    original = appmod._next_revision
-    calls = {"n": 0}
+    real_executemany = appmod._executemany
+    calls = {"written": False}
 
-    def flaky(conn, slip_no):
-        calls["n"] += 1
-        if calls["n"] == 2:  # 第 1 行写入后，第 2 行刚开始就爆炸
+    def flaky(conn, sql, params):
+        if calls["written"] and params:
+            # 已有一组真实写入落进事务后，下一组写入时爆炸
             raise RuntimeError("simulated disk failure")
-        return original(conn, slip_no)
+        result = real_executemany(conn, sql, params)
+        if params:
+            calls["written"] = True
+        return result
 
-    monkeypatch.setattr(appmod, "_next_revision", flaky)
+    monkeypatch.setattr(appmod, "_executemany", flaky)
     with pytest.raises(RuntimeError):
         body = ADJ_HEADER + "A1,S1,CC-C,1100\nA2,S2,CC-D,2100\n"
         with appmod.connect(client.db_path) as raw:
             appmod.ingest_adjustments(raw, "2027-01", body)
 
-    monkeypatch.setattr(appmod, "_next_revision", original)
+    monkeypatch.setattr(appmod, "_executemany", real_executemany)
     assert postings(client.db_path, "2027-01") == []
     assert q(client.db_path, "SELECT * FROM adjustments") == []
     assert q(client.db_path, "SELECT * FROM slip_revisions") == []
@@ -552,3 +555,294 @@ def test_import_same_slip_in_new_month_rejected(client):
     resp = post_csv(client, "/import/originals", "2027-01", ORIG_HEADER + "S1,CC-A,1000\n")
     assert "已存在" in resp.data.decode("utf-8")
     assert postings(client.db_path, "2027-01") == []
+
+
+# ------------------------------------------- 批内连续勘误（准备/入账两阶段）
+
+def test_consecutive_adjustments_same_slip_in_one_batch(client):
+    """批内连续勘误同一薪资单：后面的冲回前面刚生效的值，按 CSV 顺序落账。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+    resp = post_csv(client, "/import/adjustments", "2027-01",
+                    ADJ_HEADER + "A1,S1,CC-B,1200\nA2,S1,CC-C,900\n")
+    assert "生效 2 条" in resp.data.decode("utf-8")
+    jan = postings(client.db_path, "2027-01")
+    assert [(p["kind"], p["cost_center"], p["amount_cents"], p["adjust_no"], p["revision"])
+            for p in jan] == [
+        ("reverse", "CC-A", -1000, "A1", 1), ("rebook", "CC-B", 1200, "A1", 1),
+        ("reverse", "CC-B", -1200, "A2", 2), ("rebook", "CC-C", 900, "A2", 2)]
+    s = slip(client.db_path, "S1")
+    assert (s["cost_center"], s["amount_cents"], s["entry_month"]) == ("CC-C", 900, "2027-01")
+    hist = q(client.db_path,
+             "SELECT adjust_no, revision, mode FROM slip_revisions"
+             " WHERE slip_no='S1' ORDER BY id")
+    assert [(h["adjust_no"], h["revision"], h["mode"]) for h in hist] == [
+        ("A1", 1, "reversal"), ("A2", 2, "reversal")]
+
+
+def test_inplace_twice_in_one_batch(client):
+    """未封账月批内两次原地修改：仍只留一行原单，历史在 slip_revisions。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    resp = post_csv(client, "/import/adjustments", "2026-12",
+                    ADJ_HEADER + "A1,S1,CC-B,1100\nA2,S1,CC-C,900\n")
+    assert "生效 2 条" in resp.data.decode("utf-8")
+    rows = postings(client.db_path, "2026-12")
+    assert len(rows) == 1
+    assert (rows[0]["cost_center"], rows[0]["amount_cents"], rows[0]["adjust_no"]) == (
+        "CC-C", 900, "A2")
+    hist = q(client.db_path,
+             "SELECT adjust_no, mode FROM slip_revisions WHERE slip_no='S1' ORDER BY id")
+    assert [(h["adjust_no"], h["mode"]) for h in hist] == [("A1", "inplace"), ("A2", "inplace")]
+
+
+# ------------------------------------------- 准备期间账况变化：按最新账况重备
+
+def test_reprepare_when_entry_month_closed_during_prepare(client, monkeypatch):
+    """准备期间入账月被封账：检测到变化并按最新账况重备 → 业务冲突，整批不写。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+
+    real_commit = appmod._commit_adjustments
+    calls = {"n": 0}
+
+    def interfering(conn, plan):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            other = appmod.connect(client.db_path)
+            try:
+                appmod.close_month(other, "2027-01")  # 准备完成后、入账前封账
+            finally:
+                other.close()
+        return real_commit(conn, plan)
+
+    monkeypatch.setattr(appmod, "_commit_adjustments", interfering)
+    resp = post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+    assert "已封账" in resp.data.decode("utf-8")
+    assert calls["n"] == 1  # 首次入账发现过期，重备时即冲突，不再入账
+    assert postings(client.db_path, "2027-01") == []
+    assert q(client.db_path, "SELECT * FROM adjustments") == []
+
+
+def test_reprepare_when_slip_changed_during_prepare(client, monkeypatch):
+    """准备期间另一请求改了同一薪资单：按最新生效值重新计算冲回。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+
+    real_commit = appmod._commit_adjustments
+    calls = {"n": 0, "busy": False}
+
+    def interfering(conn, plan):
+        if calls["busy"]:  # 干扰动作自身的入账直接放行，不计数也不再干扰
+            return real_commit(conn, plan)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            calls["busy"] = True
+            try:
+                other = appmod.connect(client.db_path)
+                try:
+                    appmod.ingest_adjustments(other, "2027-01", ADJ_HEADER + "A0,S1,CC-B,1200\n")
+                finally:
+                    other.close()
+            finally:
+                calls["busy"] = False
+        return real_commit(conn, plan)
+
+    monkeypatch.setattr(appmod, "_commit_adjustments", interfering)
+    resp = post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-C,900\n")
+    assert "生效 1 条" in resp.data.decode("utf-8")
+    assert calls["n"] == 2  # 首次过期重备，第二次入账成功
+    jan = postings(client.db_path, "2027-01")
+    assert [(p["kind"], p["cost_center"], p["amount_cents"], p["adjust_no"]) for p in jan] == [
+        ("reverse", "CC-A", -1000, "A0"), ("rebook", "CC-B", 1200, "A0"),
+        ("reverse", "CC-B", -1200, "A1"), ("rebook", "CC-C", 900, "A1")]
+    s = slip(client.db_path, "S1")
+    assert (s["cost_center"], s["amount_cents"]) == ("CC-C", 900)
+
+
+def test_reprepare_when_same_adjust_no_processed_during_prepare(client, monkeypatch):
+    """准备期间同号勘误被另一请求处理：重备后按幂等规则跳过，不重复入账。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+
+    real_commit = appmod._commit_adjustments
+    calls = {"n": 0}
+
+    def interfering(conn, plan):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            other = appmod.connect(client.db_path)
+            try:
+                appmod.ingest_adjustments(other, "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+            finally:
+                other.close()
+        return real_commit(conn, plan)
+
+    monkeypatch.setattr(appmod, "_commit_adjustments", interfering)
+    resp = post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+    assert "重复跳过 1 条" in resp.data.decode("utf-8")
+    assert len(postings(client.db_path, "2027-01")) == 2
+    assert len(q(client.db_path, "SELECT * FROM adjustments")) == 1
+
+
+def test_reprepare_when_conflicting_adjust_no_processed_during_prepare(client, monkeypatch):
+    """准备期间同号异内容被另一请求处理：重备后按原规则整批拒绝。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+
+    real_commit = appmod._commit_adjustments
+    calls = {"n": 0}
+
+    def interfering(conn, plan):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            other = appmod.connect(client.db_path)
+            try:
+                appmod.ingest_adjustments(other, "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+            finally:
+                other.close()
+        return real_commit(conn, plan)
+
+    monkeypatch.setattr(appmod, "_commit_adjustments", interfering)
+    resp = post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-C,900\n")
+    assert "不同内容" in resp.data.decode("utf-8")
+    # 只有另一请求的 A1 入账；本批未写任何行
+    assert len(postings(client.db_path, "2027-01")) == 2
+    assert len(q(client.db_path, "SELECT * FROM adjustments")) == 1
+    assert slip(client.db_path, "S1")["cost_center"] == "CC-B"
+
+
+def test_unrelated_month_activity_does_not_reprepare(client, monkeypatch):
+    """无关月份的入账不影响准备结果：不触发重备，一次入账成功。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+    add_month(client, "2027-02")
+
+    real_prepare = appmod._prepare_adjustments
+    real_commit = appmod._commit_adjustments
+    calls = {"prepare": 0, "interfered": False}
+
+    def counting_prepare(conn, entry_month, rows):
+        calls["prepare"] += 1
+        return real_prepare(conn, entry_month, rows)
+
+    def interfering(conn, plan):
+        if not calls["interfered"]:
+            calls["interfered"] = True
+            other = appmod.connect(client.db_path)
+            try:
+                # 无关月份入账 + 无关薪资单：与本批核对范围无交集
+                appmod.ingest_originals(other, "2027-02", ORIG_HEADER + "S9,CC-Z,5\n")
+            finally:
+                other.close()
+        return real_commit(conn, plan)
+
+    monkeypatch.setattr(appmod, "_prepare_adjustments", counting_prepare)
+    monkeypatch.setattr(appmod, "_commit_adjustments", interfering)
+    resp = post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+    assert "生效 1 条" in resp.data.decode("utf-8")
+    assert calls["prepare"] == 1  # 没有重备
+    assert len(postings(client.db_path, "2027-01")) == 2
+
+
+def test_persistent_interference_gives_up(client, monkeypatch):
+    """账况持续变化：重备次数用完后明确报错，本批不落任何行。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+
+    real_commit = appmod._commit_adjustments
+    counter = {"adj": 0, "busy": False}
+
+    def interfering(conn, plan):
+        if counter["busy"]:  # 干扰动作自身的入账直接放行
+            return real_commit(conn, plan)
+        counter["busy"] = True
+        try:
+            counter["adj"] += 1
+            other = appmod.connect(client.db_path)
+            try:
+                appmod.ingest_adjustments(
+                    other, "2027-01",
+                    ADJ_HEADER + f"AX{counter['adj']},S1,CC-B,{1200 + counter['adj']}\n")
+            finally:
+                other.close()
+        finally:
+            counter["busy"] = False
+        return real_commit(conn, plan)
+
+    monkeypatch.setattr(appmod, "_commit_adjustments", interfering)
+    resp = post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-C,900\n")
+    assert "持续变化" in resp.data.decode("utf-8")
+    # A1 从未入账；只有干扰请求的 AX* 落账
+    assert q(client.db_path, "SELECT * FROM adjustments WHERE adjust_no='A1'") == []
+    assert len(q(client.db_path, "SELECT * FROM adjustments")) == appmod.MAX_PREPARE_ATTEMPTS
+
+
+def test_prepare_does_not_block_other_writers(tmp_path, monkeypatch):
+    """准备阶段在写事务之外：准备进行时其他请求可正常封账/入账。"""
+    import threading
+
+    db = str(tmp_path / "locks.db")
+    appmod.init_db(db)
+    conn = appmod.connect(db)
+    appmod.open_month(conn, "2026-12")
+    appmod.ingest_originals(conn, "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    appmod.close_month(conn, "2026-12")
+    appmod.open_month(conn, "2027-01")
+    appmod.open_month(conn, "2027-02")
+    conn.close()
+
+    real_load = appmod._load_state
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_load(c, entry_month, rows):
+        state = real_load(c, entry_month, rows)
+        entered.set()          # 准备已开始（尚未进入写事务）
+        release.wait(5)        # 模拟大文件推演的耗时
+        return state
+
+    monkeypatch.setattr(appmod, "_load_state", slow_load)
+
+    outcome = {}
+
+    def worker():
+        c = appmod.connect(db)
+        try:
+            outcome["result"] = appmod.ingest_adjustments(
+                c, "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+        finally:
+            c.close()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert entered.wait(5)
+
+    # 准备期间另一请求封账：若准备持有写锁，这里会阻塞到 busy_timeout
+    other = appmod.connect(db)
+    try:
+        appmod.close_month(other, "2027-02")
+    finally:
+        other.close()
+    release.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    counts, _ = outcome["result"]
+    assert counts["applied"] == 1
+    assert q(db, "SELECT status FROM months WHERE month='2027-02'")[0]["status"] == "closed"
+    assert len(postings(db, "2027-01")) == 2

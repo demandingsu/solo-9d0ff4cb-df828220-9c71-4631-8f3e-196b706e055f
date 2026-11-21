@@ -8,7 +8,13 @@
   * 原单所属月已封账 → 在开放入账月冲回上次生效值，再按更正值入账，
     两条流水都带原单号与薪资所属月；已封月明细保持原样。
 - 勘误号幂等：同号同内容只处理一次，同号不同内容整批拒绝。
-- 所有写入使用单事务；失败整体回滚，原状态保持不变。
+- 勘误批分两阶段：先在写事务之外读取账况、推演出原地修改/冲回重入的全部
+  写入内容（准备期间其他请求仍可入账与封账）；正式入账时在单个
+  BEGIN IMMEDIATE 事务内先批量核对准备所依赖的账况（月份状态、薪资单
+  生效值、勘误号、修订号），再批量写入。若账况在准备期间变化（相关月份
+  被封、薪资单被改、同号勘误已被另一请求处理），按最新账况重新准备；
+  无关月份的入账不在核对范围内，不触发重备。
+- 任一业务冲突或写入失败：整批回滚，原状态保持不变。
 """
 
 import csv
@@ -427,132 +433,233 @@ def ingest_originals(conn, entry_month, text):
 
 # ------------------------------------------------------------------ 勘误
 
+# 准备/入账的重备上限：账况持续变化时放弃并提示用户重试，避免活锁。
+MAX_PREPARE_ATTEMPTS = 5
+
+
+class _StaleState(Exception):
+    """入账前账况与准备时不一致：放弃本次计划，按最新账况重新准备。"""
+
+
 def _fingerprint(row):
     return "\x1f".join([row["slip_no"], row["cost_center"], str(row["amount_cents"])])
 
 
-def _next_revision(conn, slip_no):
-    row = conn.execute(
-        "SELECT COALESCE(MAX(revision), 0) AS r FROM slip_revisions WHERE slip_no=?",
-        (slip_no,),
-    ).fetchone()
-    return row["r"] + 1
+def _placeholders(items):
+    return ",".join("?" for _ in items)
 
 
-def apply_adjustment(conn, row, entry_month):
-    """在已开始的事务内应用一条勘误。
+def _load_state(conn, entry_month, rows):
+    """批量取出本批涉及的全部账况：月份、薪资单、已处理勘误号、当前修订号。
 
-    返回 (status, detail)，status ∈ applied / duplicate_skipped。
+    只查与本批相关的行（IN 批量查询，不逐行）：无关月份/单据的入账不会
+    改变本批的准备结果，也不会触发重备。
     """
-    fp = _fingerprint(row)
-    prior = conn.execute(
-        "SELECT * FROM adjustments WHERE adjust_no=?", (row["adjust_no"],)
-    ).fetchone()
-    if prior is not None:
-        if prior["fingerprint"] != fp:
-            raise ConflictError(
-                f"勘误号 {row['adjust_no']} 已用不同内容处理过，拒绝本次上传"
-            )
-        return "duplicate_skipped", {
-            "adjust_no": row["adjust_no"],
-            "mode": prior["mode"],
-            "entry_month": prior["entry_month"],
-            "slip_no": prior["slip_no"],
-        }
+    slip_nos = sorted({r["slip_no"] for r in rows})
+    adjust_nos = sorted({r["adjust_no"] for r in rows})
 
-    # 新勘误才需要开放入账月；重复重放无需写入，前面已处理。
-    ensure_month_open(conn, entry_month)
+    slips = {}
+    for r in conn.execute(
+        "SELECT slip_no, slip_month, cost_center, amount_cents, entry_month"
+        f" FROM slips WHERE slip_no IN ({_placeholders(slip_nos)})",
+        slip_nos,
+    ):
+        slips[r["slip_no"]] = (
+            r["slip_month"], r["cost_center"], r["amount_cents"], r["entry_month"])
 
-    slip = conn.execute(
-        "SELECT * FROM slips WHERE slip_no=?", (row["slip_no"],)
-    ).fetchone()
-    if slip is None:
-        raise ValidationError(f"薪资单 {row['slip_no']} 不存在，无法勘误")
+    month_names = sorted({entry_month} | {s[0] for s in slips.values()})
+    months = {}
+    for r in conn.execute(
+        f"SELECT month, status FROM months WHERE month IN ({_placeholders(month_names)})",
+        month_names,
+    ):
+        months[r["month"]] = r["status"]
 
-    slip_month = slip["slip_month"]
-    month_row = get_month(conn, slip_month)
-    slip_closed = month_row is not None and month_row["status"] == "closed"
-    mode = "reversal" if slip_closed else "inplace"
-    revision = _next_revision(conn, row["slip_no"])
+    adjustments = {}
+    for r in conn.execute(
+        "SELECT adjust_no, fingerprint, mode, entry_month, slip_no"
+        f" FROM adjustments WHERE adjust_no IN ({_placeholders(adjust_nos)})",
+        adjust_nos,
+    ):
+        adjustments[r["adjust_no"]] = (
+            r["fingerprint"], r["mode"], r["entry_month"], r["slip_no"])
+
+    revisions = {}
+    for r in conn.execute(
+        "SELECT slip_no, MAX(revision) AS r FROM slip_revisions"
+        f" WHERE slip_no IN ({_placeholders(slip_nos)}) GROUP BY slip_no",
+        slip_nos,
+    ):
+        revisions[r["slip_no"]] = r["r"]
+
+    return {"months": months, "slips": slips,
+            "adjustments": adjustments, "revisions": revisions}
+
+
+def _prepare_adjustments(conn, entry_month, rows):
+    """写事务外准备：读取账况，按 CSV 顺序在内存中推演每行的处理。
+
+    返回入账计划（所依赖的账况快照 + 全部待写入内容 + 结果明细），
+    不执行任何数据库写入；准备期间其他请求可正常入账与封账。
+    业务冲突（月份未开放/已封账、薪资单不存在、同号异内容）在此直接抛出。
+    """
+    state = _load_state(conn, entry_month, rows)
+    # 推演在快照副本上进行；state 本身保持读取时的原样，供入账时核对。
+    months = dict(state["months"])
+    slips = dict(state["slips"])
+    adjustments = dict(state["adjustments"])
+    revisions = dict(state["revisions"])
+
+    writes = {"postings_updates": [], "postings_inserts": [], "slips_updates": [],
+              "revisions_inserts": [], "adjustments_inserts": []}
+    counts = {"applied": 0, "duplicate_skipped": 0}
+    details = []
     now = _now()
 
-    if not slip_closed:
-        if entry_month != slip_month:
-            raise ConflictError(
-                f"原单所属月 {slip_month} 尚未封账，勘误应提交到该月直接改原行；"
-                f"当前选择的入账月为 {entry_month}"
-            )
-        # 原单未封账：直接改原行（只改成本中心与金额），仍留在原所属月。
-        conn.execute(
-            "UPDATE postings SET cost_center=?, amount_cents=?, adjust_no=?, revision=?"
-            " WHERE kind='original' AND slip_no=?",
-            (row["cost_center"], row["amount_cents"], row["adjust_no"], revision,
-             row["slip_no"]),
-        )
-        effective_month = slip_month
-    else:
-        # 原单已封账：在开放入账月冲回上次生效值，再按更正值重入账。
-        conn.execute(
-            "INSERT INTO postings(entry_month, slip_no, slip_month, kind,"
-            " cost_center, amount_cents, adjust_no, revision, created_at)"
-            " VALUES (?,?,?,'reverse',?,?,?,?,?)",
-            (entry_month, row["slip_no"], slip_month, slip["cost_center"],
-             -slip["amount_cents"], row["adjust_no"], revision, now),
-        )
-        conn.execute(
-            "INSERT INTO postings(entry_month, slip_no, slip_month, kind,"
-            " cost_center, amount_cents, adjust_no, revision, created_at)"
-            " VALUES (?,?,?,'rebook',?,?,?,?,?)",
-            (entry_month, row["slip_no"], slip_month, row["cost_center"],
-             row["amount_cents"], row["adjust_no"], revision, now),
-        )
-        effective_month = entry_month
+    for row in rows:
+        fp = _fingerprint(row)
+        prior = adjustments.get(row["adjust_no"])
+        if prior is not None:
+            if prior[0] != fp:
+                raise ConflictError(
+                    f"勘误号 {row['adjust_no']} 已用不同内容处理过，拒绝本次上传")
+            counts["duplicate_skipped"] += 1
+            details.append({"line": row["line"], "status": "duplicate_skipped",
+                            "adjust_no": row["adjust_no"], "mode": prior[1],
+                            "entry_month": prior[2], "slip_no": prior[3]})
+            continue
 
-    conn.execute(
+        # 新勘误才需要开放入账月；重复重放无需写入，前面已处理。
+        status = months.get(entry_month)
+        if status is None:
+            raise ConflictError(f"月份 {entry_month} 不存在，请先在“月份管理”中开放")
+        if status != "open":
+            raise ConflictError(f"入账月 {entry_month} 已封账，不能写入")
+
+        slip = slips.get(row["slip_no"])
+        if slip is None:
+            raise ValidationError(f"薪资单 {row['slip_no']} 不存在，无法勘误")
+        slip_month, cur_center, cur_amount, _cur_entry = slip
+        slip_closed = months.get(slip_month) == "closed"
+        revision = revisions.get(row["slip_no"], 0) + 1
+        revisions[row["slip_no"]] = revision
+
+        if not slip_closed:
+            if entry_month != slip_month:
+                raise ConflictError(
+                    f"原单所属月 {slip_month} 尚未封账，勘误应提交到该月直接改原行；"
+                    f"当前选择的入账月为 {entry_month}")
+            # 原单未封账：直接改原行（只改成本中心与金额），仍留在原所属月。
+            writes["postings_updates"].append(
+                (row["cost_center"], row["amount_cents"], row["adjust_no"],
+                 revision, row["slip_no"]))
+            mode, effective_month = "inplace", slip_month
+        else:
+            # 原单已封账：在开放入账月冲回上次生效值，再按更正值重入账。
+            writes["postings_inserts"].append(
+                (entry_month, row["slip_no"], slip_month, KIND_REVERSE,
+                 cur_center, -cur_amount, row["adjust_no"], revision, now))
+            writes["postings_inserts"].append(
+                (entry_month, row["slip_no"], slip_month, KIND_REBOOK,
+                 row["cost_center"], row["amount_cents"], row["adjust_no"],
+                 revision, now))
+            mode, effective_month = "reversal", entry_month
+
+        writes["slips_updates"].append(
+            (row["cost_center"], row["amount_cents"], effective_month, now,
+             row["slip_no"]))
+        writes["revisions_inserts"].append(
+            (row["slip_no"], revision, row["adjust_no"], row["cost_center"],
+             row["amount_cents"], mode, effective_month, now))
+        writes["adjustments_inserts"].append(
+            (row["adjust_no"], fp, row["slip_no"], slip_month, row["cost_center"],
+             row["amount_cents"], mode, effective_month, now))
+
+        # 批内按 CSV 顺序生效：后续行看到的是本次生效后的值。
+        slips[row["slip_no"]] = (
+            slip_month, row["cost_center"], row["amount_cents"], effective_month)
+        adjustments[row["adjust_no"]] = (fp, mode, effective_month, row["slip_no"])
+
+        counts["applied"] += 1
+        details.append({"line": row["line"], "status": "applied",
+                        "adjust_no": row["adjust_no"], "mode": mode,
+                        "entry_month": effective_month, "slip_no": row["slip_no"]})
+
+    return {"entry_month": entry_month, "rows": rows, "state": state,
+            "writes": writes, "counts": counts, "details": details}
+
+
+def _executemany(conn, sql, params):
+    if params:
+        conn.executemany(sql, params)
+
+
+def _flush_writes(conn, writes):
+    """批量写入；每组内部保持准备阶段的顺序（postings.id 顺序即报表顺序）。"""
+    _executemany(
+        conn,
+        "UPDATE postings SET cost_center=?, amount_cents=?, adjust_no=?, revision=?"
+        " WHERE kind='original' AND slip_no=?",
+        writes["postings_updates"])
+    _executemany(
+        conn,
+        "INSERT INTO postings(entry_month, slip_no, slip_month, kind, cost_center,"
+        " amount_cents, adjust_no, revision, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        writes["postings_inserts"])
+    _executemany(
+        conn,
         "UPDATE slips SET cost_center=?, amount_cents=?, entry_month=?, updated_at=?"
         " WHERE slip_no=?",
-        (row["cost_center"], row["amount_cents"], effective_month, now,
-         row["slip_no"]),
-    )
-    conn.execute(
+        writes["slips_updates"])
+    _executemany(
+        conn,
         "INSERT INTO slip_revisions(slip_no, revision, adjust_no, cost_center,"
         " amount_cents, mode, entry_month, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (row["slip_no"], revision, row["adjust_no"], row["cost_center"],
-         row["amount_cents"], mode, effective_month, now),
-    )
-    conn.execute(
+        writes["revisions_inserts"])
+    _executemany(
+        conn,
         "INSERT INTO adjustments(adjust_no, fingerprint, slip_no, slip_month,"
         " cost_center, amount_cents, mode, entry_month, created_at)"
         " VALUES (?,?,?,?,?,?,?,?,?)",
-        (row["adjust_no"], fp, row["slip_no"], slip_month, row["cost_center"],
-         row["amount_cents"], mode, effective_month, now),
-    )
-    return "applied", {
-        "adjust_no": row["adjust_no"],
-        "mode": mode,
-        "entry_month": effective_month,
-        "slip_no": row["slip_no"],
-    }
+        writes["adjustments_inserts"])
 
 
-def ingest_adjustments(conn, entry_month, text):
-    """批量勘误：单事务，任一写入失败则整批回滚。"""
-    entry_month = _norm_month(entry_month, "入账月")
-    rows = parse_adjustment_csv(text)
+def _commit_adjustments(conn, plan):
+    """正式入账：写事务内先批量核对准备时依赖的账况，再批量写入。
 
-    counts = {"applied": 0, "duplicate_skipped": 0}
-    details = []
+    核对不一致说明准备期间账况已变（相关月份被封、薪资单生效值被改、
+    同号勘误已被另一请求处理），抛 _StaleState 让调用方按最新账况重备。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for row in rows:
-            status, detail = apply_adjustment(conn, row, entry_month)
-            counts[status] += 1
-            details.append({"line": row["line"], "status": status, **detail})
+        current = _load_state(conn, plan["entry_month"], plan["rows"])
+        if current != plan["state"]:
+            raise _StaleState
+        _flush_writes(conn, plan["writes"])
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return counts, details
+
+
+def ingest_adjustments(conn, entry_month, text):
+    """批量勘误：计算在写事务外准备，入账时批量核对 + 批量写入。
+
+    准备期间其他请求可正常入账/封账；若相关账况在入账前变化，按最新
+    账况重新准备（最多 MAX_PREPARE_ATTEMPTS 次）。任一业务冲突或写入
+    失败：整批回滚，不落任何行。
+    """
+    entry_month = _norm_month(entry_month, "入账月")
+    rows = parse_adjustment_csv(text)
+
+    for _attempt in range(MAX_PREPARE_ATTEMPTS):
+        plan = _prepare_adjustments(conn, entry_month, rows)
+        try:
+            _commit_adjustments(conn, plan)
+        except _StaleState:
+            continue  # 账况已变，按最新状态重新准备
+        return plan["counts"], plan["details"]
+    raise ConflictError("相关账况持续变化，本批勘误暂未入账，请重新提交")
 
 
 # ------------------------------------------------------------------ 查询 / 导出
